@@ -2,52 +2,69 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
+from io import StringIO
+from urllib.request import Request, urlopen
+import math
 
 # Configuration defaults
 TICKERS_URL_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-TICKERS_URL_NASDAQ100 = "https://en.wikipedia.org/wiki/Nasdaq-100"
+TICKERS_URL_NASDAQ100 = "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies"
 DEFAULT_SMA_SHORT = 20
 DEFAULT_SMA_LONG = 50
 DEFAULT_AROC_WEEKS = 20
 
-@st.cache_data(show_spinner=False)
-def get_sp500_tickers():
-    try:
-        tables = pd.read_html(TICKERS_URL_SP500)
-        df = tables[0]
-        return df["Symbol"].tolist()
-    except Exception as e:
-        st.error(f"Failed to fetch S&P 500 tickers: {e}")
-        return []
+def read_ticker_tables(url):
+    # Wikipedia rejects the default Python user agent on some cloud hosts.
+    request = Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; StockScanner/1.0)"
+    })
+    with urlopen(request, timeout=20) as response:
+        html = response.read().decode("utf-8")
+    return pd.read_html(StringIO(html), flavor="lxml")
 
-@st.cache_data(show_spinner=False)
+
+def normalize_tickers(values):
+    return sorted({str(value).strip().replace(".", "-")
+                   for value in values if pd.notna(value) and str(value).strip()})
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def get_sp500_tickers():
+    for table in read_ticker_tables(TICKERS_URL_SP500):
+        if "Symbol" in table.columns:
+            tickers = normalize_tickers(table["Symbol"])
+            if tickers:
+                return tickers
+    raise ValueError("Could not find S&P 500 constituent symbols.")
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
 def get_nasdaq100_tickers():
-    try:
-        tables = pd.read_html(TICKERS_URL_NASDAQ100)
-        # Find the table with the tickers
-        for table in tables:
-            for col in table.columns:
-                if isinstance(col, str) and ('Ticker' in col or 'Symbol' in col):
-                    return table[col].tolist()
-        st.error("Could not find 'Ticker' or 'Symbol' column in Nasdaq 100 table.")
-        return []
-    except Exception as e:
-        st.error(f"Failed to fetch Nasdaq 100 tickers: {e}")
-        return []
+    for table in read_ticker_tables(TICKERS_URL_NASDAQ100):
+        for col in table.columns:
+            if isinstance(col, str) and col in ("Ticker", "Symbol"):
+                tickers = normalize_tickers(table[col])
+                if tickers:
+                    return tickers
+    raise ValueError("Could not find Nasdaq 100 constituent symbols.")
 
 def get_all_tickers():
-    sp500 = get_sp500_tickers()
-    nasdaq100 = get_nasdaq100_tickers()
-    combined = list(set(sp500 + nasdaq100))
+    combined = set()
+    for name, loader in (("S&P 500", get_sp500_tickers), ("Nasdaq 100", get_nasdaq100_tickers)):
+        try:
+            combined.update(loader())
+        except Exception as exc:
+            st.warning(f"Could not load {name} tickers: {exc}. Please retry shortly.")
+    combined = list(combined)
     combined.sort()
     return combined
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=900)
 def fetch_data(ticker, weeks):
     end_date = datetime.now()
     start_date = end_date - timedelta(weeks=weeks)
     try:
-        df = yf.download(ticker, start=start_date, end=end_date, interval='1d', progress=False)
+        df = yf.download(ticker, start=start_date, end=end_date, interval='1d', progress=False, auto_adjust=True, timeout=20)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df
@@ -68,11 +85,16 @@ def calc_indicators(df, sma_short, sma_long, aroc_weeks):
         return df
 
 def analyze_ticker(ticker, sma_short, sma_long, aroc_weeks):
-    df = fetch_data(ticker, weeks=aroc_weeks+10)  # Fetch enough data
+    # SMA windows count trading days, while the download range counts weeks.
+    required_days = max(sma_short, sma_long, aroc_weeks * 5 + 1)
+    weeks = math.ceil(required_days / 5) + 10
+    df = fetch_data(ticker, weeks=weeks)
     if df is None or df.empty:
         return None
     df = calc_indicators(df, sma_short, sma_long, aroc_weeks)
     latest = df.iloc[-1]
+    if latest[["Close", "SMA_short", "SMA_long", "20w_high", "AROC"]].isna().any():
+        return None
     try:
         # Combined entry logic
         entry_signal = (
@@ -107,6 +129,9 @@ def main():
 
     tickers = get_all_tickers()
     if not tickers:
+        st.error("Ticker lists are temporarily unavailable. Retry to load them again.")
+        if st.button("Retry ticker loading"):
+            st.rerun()
         st.stop()
 
     with st.sidebar:
